@@ -1,0 +1,1131 @@
+---
+title: "Calibration Final Analyses"
+output: 
+  html_document:
+      toc: true
+author: "Lathan Liou"
+date: "Report run `r format(Sys.time(), '%B %d, %Y at %I:%m %p')`"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(boot)
+library(boot.pval)
+library(janitor)
+library(rms)
+library(tidyverse)
+library(broom)
+library(htmlTable)
+library(patchwork)
+library(knitr)
+
+df <- read_csv("data/malnutrition_data_2023-04-25.csv") %>%
+  filter(!admit_year %in% c(2019, 2020),
+         age_enc < 120) %>%
+  mutate(payor_group_desc_msx = case_when(
+    payor_group_desc_msx == "Medicaid Hmo" ~ "Medicaid",
+    payor_group_desc_msx == "Medicare Hmo" ~ "Medicare",
+    payor_group_desc_msx == "Self Pay" ~ "Uninsured",
+    payor_group_desc_msx == "Unknown" ~ "Other",
+    TRUE ~ payor_group_desc_msx
+  ),
+  race_grp_msx = case_when(
+    race_grp_msx == "American Indian Or Alaska Native" ~ "Other",
+    race_grp_msx == "Native Hawaiian Or Pacific Islander" ~ "Other",
+    TRUE ~ race_grp_msx
+  ),
+  hospital_type = case_when(
+    facility == "MSB" ~ "Community Hospital",
+    facility == "MSBI" ~ "Community Hospital",
+    facility == "MSH" ~ "Quaternary Academic Hospital",
+    facility == "MSM" ~ "Tertiary Acute Care",
+    facility == "MSW" ~ "Tertiary Acute Care"
+  ))
+
+df_event <- df %>%
+  filter(rd_observation==1)
+
+K <- 5000
+
+rescale_brier <- function(x, p, ...){ 
+  format(round(1 - (x / (mean(p) * (1 - mean(p)))), digits = 2), nsmall = 2)
+}
+
+boot_val <- function(data, formula, k = K, ...){
+  out <- list()
+  for(i in 1:k){
+    sampled_df <- sample_n(data, nrow(data), replace = TRUE)
+    md <- glm(formula, data = sampled_df, family = binomial)
+    out[[i]] <- c(val.prob(predict(md, type = "response"),
+                           sampled_df$rd_observation, 
+                           pl = FALSE) %>% round(3),
+                  md$coefficients)
+  }
+  return(out)
+}
+
+calc_ci <- function(data, metric, boot_vals, n){
+  data_event <- data %>%
+    filter(rd_observation == 1)
+  x <- unlist(map(boot_vals, `[`, c(metric)))
+  if(metric == 'Brier'){
+    x <- as.numeric(rescale_brier(x, length(data_event$rd_observation)/length(data$rd_observation)))
+  }
+  paste0("(", round(quantile(x, 0.025), n), " to ", 
+         round(quantile(x, 0.975), n), ")")
+}
+
+calc_boot_stats <- function(df, formula, k = K) {
+  boot_vals_m <- boot_val(df, as.formula(formula), k = k)
+  intercept_boot_ci <- calc_ci(df, "Intercept", boot_vals_m, 3)
+  slope_boot_ci <- calc_ci(df, "Slope", boot_vals_m, 3)
+  c_boot_ci     <- calc_ci(df, "C (ROC)", boot_vals_m, 3)
+  brier_boot_ci <- calc_ci(df, "Brier", boot_vals_m, 3)
+  emax_boot_ci  <- calc_ci(df, "Emax", boot_vals_m, 3)
+  eavg_boot_ci  <- calc_ci(df, "Eavg", boot_vals_m, 3)
+  
+  return(
+    tibble(intercept = intercept_boot_ci,
+           slope = slope_boot_ci,
+           c = c_boot_ci,
+           brier = brier_boot_ci,
+           emax = emax_boot_ci,
+           eavg = eavg_boot_ci)
+  )
+  if(!is.na(boot_vals_m["(Intercept)"])) {
+    intercept_coef_bootci <- calc_ci(df, "(Intercept)", boot_vals_m, 3)
+    return(
+      tibble(intercept = intercept_boot_ci,
+             slope = slope_boot_ci,
+             c = c_boot_ci,
+             brier = brier_boot_ci,
+             emax = emax_boot_ci,
+             eavg = eavg_boot_ci,
+             intercept_coef = intercept_coef_bootci))
+  }
+  if(!is.na(boot_vals_m["prediction_score_q"])) {
+    intercept_coef_bootci <- calc_ci(df, "(Intercept)", boot_vals_m, 3)
+    slope_coef_bootci <- calc_ci(df, "prediction_score_q", boot_vals_m, 3)
+    return(
+      tibble(intercept = intercept_boot_ci,
+             slope = slope_boot_ci,
+             c = c_boot_ci,
+             brier = brier_boot_ci,
+             emax = emax_boot_ci,
+             eavg = eavg_boot_ci,
+             intercept_coef = intercept_coef_bootci,
+             slope_coef = slope_coef_bootci
+      ))
+  }
+}
+
+cal_plot <- function(data, model_name, prediction, n_percentiles = 10, se_true = TRUE, group = FALSE, 
+                     group_var){
+  group_var <- enquo(group_var)
+  if(group) {
+    p1 <- data %>%
+      group_by(!!group_var) %>%
+      mutate(bin = ntile(get(prediction), n_percentiles)) %>% 
+      # Bin prediction into 10ths
+      group_by(bin) %>%
+      mutate(n = n(), # Get ests and CIs
+             bin_pred = mean(get(prediction)),
+             bin_prob = mean(as.numeric(rd_observation)), 
+             se = sqrt((bin_prob * (1 - bin_prob)) / n), 
+             ul = bin_prob + 1.96 * se, 
+             ll = bin_prob - 1.96 * se) %>% 
+      ungroup() %>%
+      ggplot(aes(x = bin_pred, y = bin_prob, ymin = ll, ymax = ul, color = !!group_var)) +
+      # geom_pointrange(size = 0.5) +
+      scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+      scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+      geom_abline() + # 45 degree line indicating perfect calibration
+      # geom_smooth(method = "lm", se = FALSE, linetype = "dashed", 
+      #             color = "black", formula = y~-1 + x) + 
+      # straight line fit through estimates
+      geom_smooth(aes(x = get(prediction), y = as.numeric(rd_observation)),
+                  se = se_true, method = "loess") + 
+      # loess fit through estimates
+      xlab("") +
+      ylab("Observed Probability") +
+      theme_minimal() +
+      ggtitle(model_name) +
+      theme(legend.position = c(0.8, 0.2))
+    
+    # The distribution plot        
+    p2 <- ggplot(data, aes(x = get(prediction), fill = !!group_var)) +
+      # geom_histogram(bins = 200) +
+      geom_density(alpha = 0.3) +
+      scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+      xlab("Predicted Probability") +
+      ylab("") +
+      theme_minimal() +
+      scale_y_continuous(breaks = c(0, 40)) +
+      theme(panel.grid.minor = element_blank(),
+            legend.position = "none")
+    
+    # Combine them
+    p1 / p2 + plot_layout(heights =  c(4,1))
+  } else {
+    # The calibration plot        
+    p1 <- data %>%
+      mutate(bin = ntile(get(prediction), n_percentiles)) %>% 
+      # Bin prediction into 10ths
+      group_by(bin) %>%
+      mutate(n = n(), # Get ests and CIs
+             bin_pred = mean(get(prediction)),
+             bin_prob = mean(as.numeric(rd_observation)), 
+             se = sqrt((bin_prob * (1 - bin_prob)) / n), 
+             ul = bin_prob + 1.96 * se, 
+             ll = bin_prob - 1.96 * se) %>% 
+      ungroup() %>%
+      ggplot(aes(x = bin_pred, y = bin_prob, ymin = ll, ymax = ul)) +
+      geom_pointrange(size = 0.5, color = "black") +
+      scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+      scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+      geom_abline() + # 45 degree line indicating perfect calibration
+      # geom_smooth(method = "lm", se = FALSE, linetype = "dashed", 
+      #             color = "black", formula = y~-1 + x) + 
+      # straight line fit through estimates
+      geom_smooth(aes(x = get(prediction), y = as.numeric(rd_observation)), 
+                  color = "red", se = se_true, method = "loess") + 
+      # loess fit through estimates
+      xlab("") +
+      ylab("Observed Probability") +
+      theme_minimal() +
+      ggtitle(model_name)
+    
+    # The distribution plot        
+    p2 <- ggplot(data, aes(x = get(prediction))) +
+      # geom_histogram(fill = "black", bins = 200) +
+      geom_density(alpha = 0.3) +
+      scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+      xlab("Predicted Probability") +
+      ylab("") +
+      theme_minimal() +
+      scale_y_continuous(breaks = c(0, 40)) +
+      theme(panel.grid.minor = element_blank())
+    
+    # Combine them
+    p1 / p2 + plot_layout(heights =  c(4,1))
+  }
+}
+
+estimate_cal <- function(data) {
+  
+  data_event <- data %>%
+    filter(rd_observation==1)
+  
+  data$prediction_score_q <- qlogis(data$prediction_score)
+  
+  #intercept = 0, beta = 1 (perfect linear model)
+  m1 <- glm(rd_observation  ~ -1 + offset(prediction_score_q), data = data, family = binomial)
+  
+  # Recalibration in the Large (estimate intercept, beta = 1)
+  m2 <- glm(rd_observation ~  1 + offset(prediction_score_q), data = data, family = binomial)
+  tidy(m2, exponentiate = TRUE, conf.int = TRUE)
+  
+  # Logisitic Calibration (estimate both)
+  m3 <- glm(rd_observation ~  1 + prediction_score_q,  data = data, family = binomial)
+  tidy(m3, exponentiate = TRUE, conf.int = TRUE)
+  
+  data$m1_pred <- predict(m1, type = "response")
+  data$m2_pred <- predict(m2, type = "response")
+  data$m3_pred <- predict(m3, type = "response")
+  
+  val_m1 <- val.prob(data$m1_pred, data$rd_observation, pl = FALSE) %>% round(3)
+  val_m2 <- val.prob(data$m2_pred, data$rd_observation, pl = FALSE) %>% round(3)
+  val_m3 <- val.prob(data$m3_pred, data$rd_observation, pl = FALSE) %>% round(3)
+  
+  b1 <- rescale_brier(val_m1["Brier"], length(data_event$rd_observation)/length(data$rd_observation)) 
+  b2 <- rescale_brier(val_m2["Brier"], length(data_event$rd_observation)/length(data$rd_observation))
+  b3 <- rescale_brier(val_m3["Brier"], length(data_event$rd_observation)/length(data$rd_observation))
+  
+  val_pro <- t(rbind(val_m1, val_m2, val_m3))
+  
+  list(m1 = m1,
+       m2 = m2,
+       m3 = m3,
+       data = data,
+       val_m1 = val_m1,
+       val_m2 = val_m2,
+       val_m3 = val_m3,
+       b1 = b1,
+       b2 = b2,
+       b3 = b3,
+       val_pro = val_pro)
+}
+
+# wrapper function for calc_boot_stats
+analyze_boot_wrapper <- function(data, estimate, seed = 12345, k = K) {
+  # estimate is from estimate_cal
+  
+  set.seed(seed)
+  
+  m1_boot_stats <- calc_boot_stats(data,
+                                   "rd_observation  ~ -1 + offset(prediction_score_q)",
+                                   k = k)
+  m2_boot_stats <- calc_boot_stats(data,
+                                   "rd_observation  ~ 1 + offset(prediction_score_q)",
+                                   k = k)
+  m3_boot_stats <- calc_boot_stats(data,
+                                   "rd_observation  ~ 1 + prediction_score_q",
+                                   k = k)
+  
+  model_tab <- tibble(
+    est = c("Intercept", "Slope", "Residual deviance", "Df", 
+            "LRT Chisq p-value", "Brier score (rescaled)",
+            "Calibration Intercept", "Calibration Slope",
+            "Emax", "Eavg", "c-statistic"),
+    m1_est = c(round(c(0, 1, estimate$m1$deviance, estimate$m1$df.residual, 0), 3), 
+               paste(estimate$b1, m1_boot_stats$brier), 
+               paste(estimate$val_m1["Intercept"], m1_boot_stats$intercept),
+               paste(estimate$val_m1["Slope"], m1_boot_stats$slope),
+               paste(estimate$val_m1["Emax"], m1_boot_stats$emax),
+               paste(estimate$val_m1["Eavg"], m1_boot_stats$eavg),
+               paste(round(estimate$val_m1["C (ROC)"], 3), m1_boot_stats$c)),
+    m2_est = c(paste(round(broom::tidy(estimate$m2)$estimate[1], 3), m2_boot_stats$intercept_coef),
+               round(c(1, estimate$m2$deviance, estimate$m2$df.residual, 0), 3), 
+               paste(estimate$b2, m2_boot_stats$brier), 
+               paste(estimate$val_m2["Intercept"], m2_boot_stats$intercept),
+               paste(estimate$val_m2["Slope"], m2_boot_stats$slope),
+               paste(estimate$val_m2["Emax"], m2_boot_stats$emax),
+               paste(estimate$val_m2["Eavg"], m2_boot_stats$eavg), 
+               paste(round(estimate$val_m2["C (ROC)"], 3), m2_boot_stats$c)),
+    m3_est = c(paste(round(broom::tidy(estimate$m3)$estimate[1],3), m3_boot_stats$intercept_coef),
+               paste(round(broom::tidy(estimate$m3)$estimate[2],3), m3_boot_stats$slope_coef),
+               round(c(estimate$m3$deviance, estimate$m3$df.residual, 0), 3), 
+               paste(estimate$b3, m3_boot_stats$brier),
+               paste(estimate$val_m3["Intercept"], m3_boot_stats$intercept),
+               paste(estimate$val_m3["Slope"], m3_boot_stats$slope),
+               paste(estimate$val_m3["Emax"], m3_boot_stats$emax),
+               paste(estimate$val_m3["Eavg"], m3_boot_stats$eavg),
+               paste(round(estimate$val_m3["C (ROC)"], 3), m3_boot_stats$c))
+  )
+  
+  names(model_tab) <- c("Statistic", "No Recalibration", "Recalibration in the Large", 
+                        "Logistic Recalibration")
+  
+  model_tab
+}
+```
+
+## Full Sample Calibration
+
+The full sample includes observations from 2021-2022. For HOMR, see https://darrendahly.github.io/post/homr/
+
+### Full Sample Estimate
+```{r full_sample_estimate}
+full_estimate <- estimate_cal(df)
+
+tidy(full_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(full_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Full Sample Validate
+
+```{r full_sample_validate}
+htmlTable(format(round(full_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Full Sample Bootstrap
+```{r full_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(full_estimate$data, full_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Calibration and Recalibration Plots
+```{r full_sample_plots, fig.show="hold", out.width="33%"}
+cal_plot(full_estimate$data, "No Recalibration", "m1_pred")
+cal_plot(full_estimate$data, "Recalibration in the Large", "m2_pred")
+cal_plot(full_estimate$data, "Logistic Recalibration", "m3_pred")
+```
+
+## Calibration by Race
+```{r}
+race_dfs <- map(unique(df$race_grp_msx), ~ df %>%
+                  filter(race_grp_msx == .x)) %>%
+  setNames(unique(df$race_grp_msx))
+```
+
+### White Estimate
+```{r white_sample_estimate}
+white_estimate <- estimate_cal(race_dfs$White)
+
+tidy(white_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(white_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### White Validate
+```{r white_sample_validate}
+htmlTable(format(round(white_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### White Bootstrap
+```{r white_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(white_estimate$data, white_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Black Estimate
+```{r black_sample_estimate}
+black_estimate <- estimate_cal(race_dfs$`Black Or African-American`)
+
+tidy(black_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(black_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Black Validate
+```{r black_sample_validate}
+htmlTable(format(round(black_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Black Bootstrap
+```{r black_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(black_estimate$data, black_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Asian Estimate
+```{r asian_sample_estimate}
+asian_estimate <- estimate_cal(race_dfs$Asian)
+
+tidy(asian_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(asian_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Asian Validate
+```{r asian_sample_validate}
+htmlTable(format(round(asian_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Asian Bootstrap
+```{r asian_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(asian_estimate$data, asian_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### American Indian Estimate
+```{r indian_sample_estimate, eval=FALSE}
+indian_estimate <- estimate_cal(race_dfs$`American Indian Or Alaska Native`)
+
+tidy(indian_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r, eval=FALSE}
+tidy(indian_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### American Indian Validate
+```{r indian_sample_validate, eval=FALSE}
+htmlTable(format(round(indian_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### American Indian Bootstrap
+```{r indian_sample_bootstrap, eval=FALSE}
+htmlTable(analyze_boot_wrapper(indian_estimate$data, indian_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Hawaiian Estimate
+```{r hawaiian_sample_estimate, eval=FALSE}
+hawaiian_estimate <- estimate_cal(race_dfs$`Native Hawaiian Or Pacific Islander`)
+
+tidy(hawaiian_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r, eval=FALSE}
+tidy(hawaiian_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Hawaiian Validate
+```{r hawaiian_sample_validate, eval=FALSE}
+htmlTable(format(round(hawaiian_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Hawaiian Bootstrap
+```{r hawaiian_sample_bootstrap, eval=FALSE}
+htmlTable(analyze_boot_wrapper(hawaiian_estimate$data, hawaiian_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Other Estimate
+```{r other_sample_estimate}
+other_estimate <- estimate_cal(race_dfs$Other)
+
+tidy(other_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r, eval=FALSE}
+tidy(other_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Other Validate
+```{r other_sample_validate}
+htmlTable(format(round(other_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Other Bootstrap
+```{r other_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(other_estimate$data, other_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Black and White Plot
+```{r black_white_plots, fig.show="hold", out.width="33%"}
+black_white_data <- bind_rows(black_estimate$data %>%
+                                mutate(race = "Black"),
+                              white_estimate$data %>%
+                                mutate(race = "White"))
+cal_plot(black_white_data, "No Recalibration", "m1_pred", group = TRUE, group_var = race)
+cal_plot(black_white_data, "Recalibration in the Large", "m2_pred", group = TRUE, group_var = race)
+cal_plot(black_white_data, "Logistic Recalibration", "m3_pred", group = TRUE, group_var = race)
+```
+
+### All Races Plot
+```{r all_race_plots, fig.show="hold", out.width="33%"}
+all_race_data <- bind_rows(black_estimate$data %>%
+                             mutate(race = "Black"),
+                           white_estimate$data %>%
+                             mutate(race = "White"),
+                           asian_estimate$data %>%
+                             mutate(race = "Asian"),
+                           # hawaiian_estimate$data %>%
+                           #   mutate(race = "Pacific"),
+                           # indian_estimate$data %>%
+                           #   mutate(race = "Native American"),
+                           other_estimate$data %>%
+                             mutate(race = "Other"))
+cal_plot(all_race_data, "No Recalibration", "m1_pred", group = TRUE, group_var = race)
+cal_plot(all_race_data, "Recalibration in the Large", "m2_pred", group = TRUE, group_var = race)
+cal_plot(all_race_data, "Logistic Recalibration", "m3_pred", group = TRUE, group_var = race)
+```
+
+## Calibration by Gender
+```{r}
+gender_dfs <- map(unique(df$enc_gender_src), ~ df %>%
+                    filter(enc_gender_src == .x)) %>%
+  setNames(unique(df$enc_gender_src))
+```
+
+### Male Estimate
+```{r male_sample_estimate}
+male_estimate <- estimate_cal(gender_dfs$Male)
+
+tidy(male_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(male_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Male Validate
+```{r male_sample_validate}
+htmlTable(format(round(male_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Male Bootstrap
+```{r male_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(male_estimate$data, male_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Female Estimate
+```{r female_sample_estimate}
+female_estimate <- estimate_cal(gender_dfs$Female)
+
+tidy(female_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(female_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Female Validate
+```{r female_sample_validate}
+htmlTable(format(round(female_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Female Bootstrap
+```{r female_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(female_estimate$data, female_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Male and Female Plot
+```{r male_female_plots, fig.show="hold", out.width="33%"}
+male_female_data <- bind_rows(male_estimate$data %>%
+                                mutate(gender = "Male"),
+                              female_estimate$data %>%
+                                mutate(gender = "Female"))
+cal_plot(male_female_data, "No Recalibration", "m1_pred", group = TRUE, group_var = gender)
+cal_plot(male_female_data, "Recalibration in the Large", "m2_pred", group = TRUE, group_var = gender)
+cal_plot(male_female_data, "Logistic Recalibration", "m3_pred", group = TRUE, group_var = gender)
+```
+
+## Calibration by Hospital Type
+```{r}
+hospital_type_dfs <- map(unique(df$hospital_type), ~ df %>%
+                           filter(hospital_type == .x)) %>%
+  setNames(unique(df$hospital_type))
+```
+
+### Community Estimate
+```{r community_sample_estimate}
+community_estimate <- estimate_cal(hospital_type_dfs$`Community Hospital`)
+
+tidy(community_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(community_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Community Validate
+```{r community_sample_validate}
+htmlTable(format(round(community_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Community Bootstrap
+```{r community_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(community_estimate$data, community_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Tertiary Acute Care Estimate
+```{r acute_sample_estimate}
+acute_estimate <- estimate_cal(hospital_type_dfs$`Tertiary Acute Care`)
+
+tidy(acute_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(acute_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Tertiary Acute Care Validate
+```{r acute_sample_validate}
+htmlTable(format(round(acute_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Tertiary Acute Care Bootstrap
+```{r acute_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(acute_estimate$data, acute_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Quaternary Academic Estimate
+```{r acdemic_sample_estimate}
+academic_estimate <- estimate_cal(hospital_type_dfs$`Quaternary Academic Hospital`)
+
+tidy(academic_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(academic_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Quarternary Academic Validate
+```{r academic_sample_validate}
+htmlTable(format(round(academic_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Quaternary Academic Bootstrap
+```{r academic_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(academic_estimate$data, academic_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Hospital Type Plot
+```{r hospital_type_plots, fig.show="hold", out.width="33%"}
+hospital_type_data <- bind_rows(community_estimate$data %>%
+                                  mutate(hospital_type = "Community Hospital"),
+                                acute_estimate$data %>%
+                                  mutate(hospital_type = "Tertiary Acute Care"),
+                                academic_estimate$data %>%
+                                  mutate(hospital_type = "Quaternary Academic Hospital"))
+cal_plot(hospital_type_data, "No Recalibration", "m1_pred", group = TRUE, group_var = hospital_type)
+cal_plot(hospital_type_data, "Recalibration in the Large", "m2_pred", group = TRUE, group_var = hospital_type)
+cal_plot(hospital_type_data, "Logistic Recalibration", "m3_pred", group = TRUE, group_var = hospital_type)
+```
+
+## Calibration by Hospital Site
+```{r, eval=FALSE}
+hospital_dfs <- map(unique(df$facility), ~ df %>%
+                      filter(facility == .x)) %>%
+  setNames(unique(df$facility))
+```
+
+### MSH Estimate
+```{r msh_sample_estimate, eval=FALSE}
+msh_estimate <- estimate_cal(hospital_dfs$MSH)
+
+tidy(msh_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r, eval=FALSE}
+tidy(msh_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### MSH Validate
+```{r msh_sample_validate, eval=FALSE}
+htmlTable(format(round(msh_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### MSH Bootstrap
+```{r msh_sample_bootstrap, eval=FALSE}
+htmlTable(analyze_boot_wrapper(msh_estimate$data, msh_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### MSM Estimate
+```{r msm_sample_estimate, eval=FALSE}
+msm_estimate <- estimate_cal(hospital_dfs$MSM)
+
+tidy(msm_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r, eval=FALSE}
+tidy(msm_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### MSM Validate
+```{r msm_sample_validate, eval=FALSE}
+htmlTable(format(round(msm_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### MSM Bootstrap
+```{r msm_sample_bootstrap, eval=FALSE}
+htmlTable(analyze_boot_wrapper(msm_estimate$data, msm_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### MSW Estimate
+```{r msw_sample_estimate, eval=FALSE}
+msw_estimate <- estimate_cal(hospital_dfs$MSW)
+
+tidy(msw_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r, eval=FALSE}
+tidy(msw_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### MSW Validate
+```{r msw_sample_validate, eval=FALSE}
+htmlTable(format(round(msw_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### MSW Bootstrap
+```{r msw_sample_bootstrap, eval=FALSE}
+htmlTable(analyze_boot_wrapper(msw_estimate$data, msw_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### MSBI Estimate
+```{r msbi_sample_estimate, eval=FALSE}
+msbi_estimate <- estimate_cal(hospital_dfs$MSBI)
+
+tidy(msbi_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r, eval=FALSE}
+tidy(msbi_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### MSBI Validate
+```{r msbi_sample_validate, eval=FALSE}
+htmlTable(format(round(msbi_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### MSBI Bootstrap
+```{r msbi_sample_bootstrap, eval=FALSE}
+htmlTable(analyze_boot_wrapper(msbi_estimate$data, msbi_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### MSB Estimate
+```{r msb_sample_estimate, eval=FALSE}
+msb_estimate <- estimate_cal(hospital_dfs$MSB)
+
+tidy(msb_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r, eval=FALSE}
+tidy(msb_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### MSB Validate
+```{r msb_sample_validate, eval=FALSE}
+htmlTable(format(round(msb_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### MSB Bootstrap
+```{r msb_sample_bootstrap, eval=FALSE}
+htmlTable(analyze_boot_wrapper(msb_estimate$data, msb_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Hospital Site Plot
+```{r hospital_plots, fig.show="hold", out.width="33%", eval=FALSE}
+hospital_data <- bind_rows(msm_estimate$data %>%
+                             mutate(facility = "MSM"),
+                           msh_estimate$data %>%
+                             mutate(facility = "MSH"),
+                           msw_estimate$data %>% 
+                             mutate(facility = "MSW"),
+                           msbi_estimate$data %>% 
+                             mutate(facility = "MSBI"),
+                           msb_estimate$data %>% 
+                             mutate(facility = "MSB"))
+cal_plot(hospital_data, "No Recalibration", "m1_pred", group = TRUE, group_var = facility)
+cal_plot(hospital_data, "Recalibration in the Large", "m2_pred", group = TRUE, group_var = facility)
+cal_plot(hospital_data, "Logistic Recalibration", "m3_pred", group = TRUE, group_var = facility)
+```
+
+## Calibration by Payor Type
+```{r}
+payor_type_dfs <- map(unique(df$payor_group_desc_msx), ~ df %>%
+                        filter(payor_group_desc_msx == .x)) %>%
+  setNames(unique(df$payor_group_desc_msx))
+```
+
+### Medicare Estimate
+```{r medicare_sample_estimate}
+medicare_estimate <- estimate_cal(payor_type_dfs$Medicare)
+
+tidy(medicare_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(medicare_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Medicare Validate
+```{r medicare_sample_validate}
+htmlTable(format(round(medicare_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Medicare Bootstrap
+```{r medicare_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(medicare_estimate$data, medicare_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Medicaid Estimate
+```{r medicaid_sample_estimate}
+medicaid_estimate <- estimate_cal(payor_type_dfs$Medicaid)
+
+tidy(medicaid_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(medicaid_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Medicaid Validate
+```{r medicaid_sample_validate}
+htmlTable(format(round(medicaid_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Medicaid Bootstrap
+```{r medicaid_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(medicaid_estimate$data, medicaid_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Commercial Estimate
+```{r commercial_sample_estimate}
+commercial_estimate <- estimate_cal(payor_type_dfs$Commercial)
+
+tidy(commercial_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(commercial_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Commercial Validate
+```{r commercial_sample_validate}
+htmlTable(format(round(commercial_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Commercial Bootstrap
+```{r commercial_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(commercial_estimate$data, commercial_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Payor Types Plot
+```{r payor_type_plots, fig.show="hold", out.width="33%"}
+payor_type_data <- bind_rows(medicare_estimate$data %>%
+                               mutate(payor_type = "Medicare"),
+                             medicaid_estimate$data %>%
+                               mutate(payor_type = "Medicaid"),
+                             commercial_estimate$data %>% 
+                               mutate(payor_type = "Commercial"))
+cal_plot(payor_type_data, "No Recalibration", "m1_pred", group = TRUE, group_var = payor_type)
+cal_plot(payor_type_data, "Recalibration in the Large", "m2_pred", group = TRUE, group_var = payor_type)
+cal_plot(payor_type_data, "Logistic Recalibration", "m3_pred", group = TRUE, group_var = payor_type)
+```
+
+## Calibration by Med/Surg
+```{r}
+medsurg_dfs <- map(unique(df$med_surg_flag_msx), ~ df %>%
+                     filter(med_surg_flag_msx == .x)) %>%
+  setNames(unique(df$med_surg_flag_msx))
+```
+
+### Medical Estimate
+```{r medical_sample_estimate}
+medical_estimate <- estimate_cal(medsurg_dfs$Med)
+
+tidy(medical_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(medical_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Medical Validate
+```{r medical_sample_validate}
+htmlTable(format(round(medical_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Medical Bootstrap
+```{r medical_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(medical_estimate$data, medical_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Surgical Estimate
+```{r surgical_sample_estimate}
+surgical_estimate <- estimate_cal(medsurg_dfs$Surg)
+
+tidy(surgical_estimate$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(surgical_estimate$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### Surgical Validate
+```{r surgical_sample_validate}
+htmlTable(format(round(surgical_estimate$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### Surgical Bootstrap
+```{r surgical_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(surgical_estimate$data, surgical_estimate, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### Med/Surg Plot
+```{r medsurg_plots, fig.show="hold", out.width="33%"}
+medsurg_data <- bind_rows(medical_estimate$data %>%
+                            mutate(medsurg = "Medical"),
+                          surgical_estimate$data %>%
+                            mutate(medsurg = "Surgical"))
+cal_plot(medsurg_data, "No Recalibration", "m1_pred", group = TRUE, group_var = medsurg)
+cal_plot(medsurg_data, "Recalibration in the Large", "m2_pred", group = TRUE, group_var = medsurg)
+cal_plot(medsurg_data, "Logistic Recalibration", "m3_pred", group = TRUE, group_var = medsurg)
+```
+
+## Calibration by Year (2022 vs. previous)
+```{r}
+year_dfs <- map(unique(df$admit_year), ~ df %>%
+                  filter(admit_year == .x)) %>%
+  setNames(unique(df$admit_year))
+```
+
+### 2020 Estimate
+```{r 2020_sample_estimate, eval=FALSE}
+estimate2020 <- estimate_cal(year_dfs$`2020`)
+
+tidy(estimate2020$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r, eval=FALSE}
+tidy(estimate2020$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### 2020 Validate
+```{r 2020_sample_validate, eval=FALSE}
+htmlTable(format(round(estimate2020$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### 2020 Bootstrap
+```{r 2020_sample_bootstrap, eval=FALSE}
+htmlTable(analyze_boot_wrapper(estimate2020$data, estimate2020, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### 2021 Estimate
+```{r 2021_sample_estimate}
+estimate2021 <- estimate_cal(year_dfs$`2021`)
+
+tidy(estimate2021$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(estimate2021$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### 2021 Validate
+```{r 2021_sample_validate}
+htmlTable(format(round(estimate2021$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### 2021 Bootstrap
+```{r 2021_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(estimate2021$data, estimate2021, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+### 2022 Estimate
+```{r 2022_sample_estimate}
+estimate2022 <- estimate_cal(year_dfs$`2022`)
+
+tidy(estimate2022$m2, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+```{r}
+tidy(estimate2022$m3, exponentiate = TRUE, conf.int = TRUE) %>% kable()
+```
+
+### 2022 Validate
+```{r 2022_sample_validate}
+htmlTable(format(round(estimate2022$val_pro, 3), nsmall = 3), 
+          header = c("No Recalibration", "Recalibration in the Large", "Logistic Recalibration"),
+          caption = "Validated Predicted Probabilities",
+          css.table = "width:100%;border: none")
+```
+
+### 2022 Bootstrap
+```{r 2022_sample_bootstrap}
+htmlTable(analyze_boot_wrapper(estimate2022$data, estimate2022, k = K),
+          caption = "Bootstrapping CI output",
+          css.table = "width:100%;border: none")
+```
+
+## Year Plot
+```{r year_plots, fig.show="hold", out.width="33%"}
+year_data <- bind_rows(estimate2021$data %>%
+                         mutate(year = 2021),
+                       estimate2022$data %>% 
+                         mutate(year = 2022)) %>%
+  mutate(year = as.factor(year))
+cal_plot(year_data, "No Recalibration", "m1_pred", group = TRUE, group_var = year)
+cal_plot(year_data, "Recalibration in the Large", "m2_pred", group = TRUE, group_var = year)
+cal_plot(year_data, "Logistic Recalibration", "m3_pred", group = TRUE, group_var = year)
+```
